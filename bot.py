@@ -320,6 +320,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"<b>Settings for this chat</b>\n\n"
         f"DeSo price: <b>{price_str}</b>\n"
         f"Min threshold: <b>{threshold_str}</b> {deso_equiv}\n"
+        f"Total subscribers: <b>{len(state['subscribers'])}</b>\n"
         f"Last block: <code>{state['last_block']}</code>",
         parse_mode="HTML",
     )
