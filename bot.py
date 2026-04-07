@@ -396,6 +396,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setmin", setmin))
     app.add_handler(CommandHandler("price", price_cmd))
     app.add_handler(CommandHandler("settings", settings))
+    app.add_handler(CommandHandler("status", status))
 
     app.job_queue.run_repeating(check_unstakes, interval=POLL_INTERVAL, first=5)
 
