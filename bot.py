@@ -46,6 +46,7 @@ def init_db() -> None:
                     chat_id BIGINT PRIMARY KEY,
                     min_usd FLOAT NOT NULL DEFAULT 0
                 );
+                ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS min_usd FLOAT NOT NULL DEFAULT 0;
             """)
         conn.commit()
     logger.info("Database initialized")
