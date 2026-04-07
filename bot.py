@@ -2,10 +2,9 @@ import logging
 import os
 import time
 import psycopg2
-import psycopg2.extras
 import requests
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, Chat
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
@@ -26,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 state = {
     "last_block": 0,
-    "chat_ids": set(),
-    "min_usd": 0.0,
+    # chat_id -> min_usd (0 = notify all)
+    "subscribers": {},
     "deso_price_usd": None,
     "price_updated_at": 0.0,
 }
@@ -44,11 +43,8 @@ def init_db() -> None:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscribers (
-                    chat_id BIGINT PRIMARY KEY
-                );
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
+                    chat_id BIGINT PRIMARY KEY,
+                    min_usd FLOAT NOT NULL DEFAULT 0
                 );
             """)
         conn.commit()
@@ -58,22 +54,17 @@ def init_db() -> None:
 def load_from_db() -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT chat_id FROM subscribers")
-            state["chat_ids"] = {row[0] for row in cur.fetchall()}
-
-            cur.execute("SELECT value FROM settings WHERE key = 'min_usd'")
-            row = cur.fetchone()
-            state["min_usd"] = float(row[0]) if row else 0.0
-
-    logger.info(f"Loaded {len(state['chat_ids'])} subscriber(s), min_usd=${state['min_usd']}")
+            cur.execute("SELECT chat_id, min_usd FROM subscribers")
+            state["subscribers"] = {row[0]: row[1] for row in cur.fetchall()}
+    logger.info(f"Loaded {len(state['subscribers'])} subscriber(s)")
 
 
-def db_add_subscriber(chat_id: int) -> None:
+def db_add_subscriber(chat_id: int, min_usd: float = 0) -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO subscribers (chat_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                (chat_id,)
+                "INSERT INTO subscribers (chat_id, min_usd) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (chat_id, min_usd)
             )
         conn.commit()
 
@@ -85,13 +76,13 @@ def db_remove_subscriber(chat_id: int) -> None:
         conn.commit()
 
 
-def db_set_min_usd(amount: float) -> None:
+def db_set_min_usd(chat_id: int, amount: float) -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO settings (key, value) VALUES ('min_usd', %s)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            """, (str(amount),))
+            cur.execute(
+                "UPDATE subscribers SET min_usd = %s WHERE chat_id = %s",
+                (amount, chat_id)
+            )
         conn.commit()
 
 
@@ -144,6 +135,14 @@ def short_key(key: str) -> str:
     return f"{key[:8]}...{key[-6:]}" if len(key) > 14 else key
 
 
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    if chat.type == Chat.PRIVATE:
+        return True
+    member = await chat.get_member(update.effective_user.id)
+    return member.status in ("creator", "administrator")
+
+
 def build_notification(txn: dict, height: int, deso_amount: float | None, usd_value: float | None) -> str:
     staker = txn.get("PublicKeyBase58Check", "Unknown")
     txn_hash = txn.get("TransactionIDBase58Check", "Unknown")
@@ -168,15 +167,24 @@ def build_notification(txn: dict, height: int, deso_amount: float | None, usd_va
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    already_subscribed = chat_id in state["chat_ids"]
-    state["chat_ids"].add(chat_id)
-    db_add_subscriber(chat_id)
+    chat_type = update.effective_chat.type
+    is_group = chat_type in (Chat.GROUP, Chat.SUPERGROUP)
+
+    already_subscribed = chat_id in state["subscribers"]
+    if not already_subscribed:
+        state["subscribers"][chat_id] = 0
+        db_add_subscriber(chat_id)
 
     price = get_deso_price()
     price_str = f"${price:,.4f}" if price else "unavailable"
-    min_usd = state["min_usd"]
+    min_usd = state["subscribers"].get(chat_id, 0)
     threshold_str = f"${min_usd:,.2f}" if min_usd > 0 else "None (all unstakes)"
-    msg = "Welcome back! You're already subscribed." if already_subscribed else "You're now subscribed to DeSo unstake alerts!"
+    msg = "Already subscribed!" if already_subscribed else (
+        "This group is now subscribed to DeSo unstake alerts!" if is_group
+        else "You're now subscribed to DeSo unstake alerts!"
+    )
+
+    admin_note = "\n\nOnly group admins can use /setmin." if is_group else ""
 
     await update.message.reply_text(
         f"<b>DeSo Unstake Monitor</b>\n"
@@ -189,25 +197,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"  e.g. <code>/setmin 0</code> → notify for all unstakes\n"
         f"/price — current DeSo price\n"
         f"/settings — show current config\n"
-        f"/stop — unsubscribe from alerts\n"
-        f"/status — last block scanned",
+        f"/stop — unsubscribe from alerts"
+        f"{admin_note}",
         parse_mode="HTML",
     )
-    logger.info(f"{'Re-registered' if already_subscribed else 'Registered'} chat_id: {chat_id} — total: {len(state['chat_ids'])}")
+    logger.info(f"{'Re-registered' if already_subscribed else 'Registered'} chat_id: {chat_id} ({chat_type})")
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    state["chat_ids"].discard(chat_id)
+    chat_type = update.effective_chat.type
+    is_group = chat_type in (Chat.GROUP, Chat.SUPERGROUP)
+
+    # Only admins can unsubscribe a group
+    if is_group and not await is_admin(update, context):
+        await update.message.reply_text("Only group admins can unsubscribe this chat.")
+        return
+
+    state["subscribers"].pop(chat_id, None)
     db_remove_subscriber(chat_id)
-    await update.message.reply_text("You've been unsubscribed. Send /start anytime to re-subscribe.")
-    logger.info(f"Unsubscribed chat_id: {chat_id} — remaining: {len(state['chat_ids'])}")
+    await update.message.reply_text("Unsubscribed. Send /start anytime to re-subscribe.")
+    logger.info(f"Unsubscribed chat_id: {chat_id}")
 
 
 async def setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+
+    if chat_id not in state["subscribers"]:
+        await update.message.reply_text("Please send /start first to subscribe.")
+        return
+
+    if not await is_admin(update, context):
+        await update.message.reply_text("Only group admins can change the threshold.")
+        return
+
     if not context.args:
         await update.message.reply_text("Usage: /setmin <amount>\nExample: /setmin 10000")
         return
+
     try:
         amount = float(context.args[0].replace(",", "").replace("$", ""))
         if amount < 0:
@@ -216,8 +243,8 @@ async def setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Please provide a valid number. Example: /setmin 10000")
         return
 
-    state["min_usd"] = amount
-    db_set_min_usd(amount)
+    state["subscribers"][chat_id] = amount
+    db_set_min_usd(chat_id, amount)
     price = get_deso_price()
 
     if amount == 0:
@@ -233,41 +260,35 @@ async def setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     price = get_deso_price()
-    if price:
-        min_usd = state["min_usd"]
-        deso_thresh = f"{min_usd / price:,.2f} DESO" if min_usd > 0 else "N/A"
-        await update.message.reply_text(
-            f"DeSo price: <b>${price:,.4f}</b>\n"
-            f"Your threshold: <b>{'${:,.2f}'.format(min_usd) if min_usd > 0 else 'None'}</b>"
-            f"{f' = {deso_thresh}' if min_usd > 0 else ''}",
-            parse_mode="HTML",
-        )
-    else:
+    if not price:
         await update.message.reply_text("Could not fetch price right now. Try again shortly.")
+        return
+
+    chat_id = update.effective_chat.id
+    min_usd = state["subscribers"].get(chat_id, 0)
+    deso_thresh = f"{min_usd / price:,.2f} DESO" if min_usd > 0 else "N/A"
+
+    await update.message.reply_text(
+        f"DeSo price: <b>${price:,.4f}</b>\n"
+        f"Threshold: <b>{'${:,.2f}'.format(min_usd) if min_usd > 0 else 'None'}</b>"
+        f"{f' = {deso_thresh}' if min_usd > 0 else ''}",
+        parse_mode="HTML",
+    )
 
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
     price = get_deso_price()
-    min_usd = state["min_usd"]
+    min_usd = state["subscribers"].get(chat_id, 0)
     price_str = f"${price:,.4f}" if price else "unavailable"
     threshold_str = f"${min_usd:,.2f}" if min_usd > 0 else "None (all unstakes)"
     deso_equiv = f"(~{min_usd / price:,.2f} DESO)" if price and min_usd > 0 else ""
 
     await update.message.reply_text(
-        f"<b>Current Settings</b>\n\n"
+        f"<b>Settings for this chat</b>\n\n"
         f"DeSo price: <b>{price_str}</b>\n"
         f"Min threshold: <b>{threshold_str}</b> {deso_equiv}\n"
-        f"Subscribers: <b>{len(state['chat_ids'])}</b>\n"
         f"Last block: <code>{state['last_block']}</code>",
-        parse_mode="HTML",
-    )
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        f"Status: Running\n"
-        f"Subscribers: <b>{len(state['chat_ids'])}</b>\n"
-        f"Last block checked: <code>{state['last_block']}</code>",
         parse_mode="HTML",
     )
 
@@ -275,9 +296,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Polling loop ──────────────────────────────────────────────────────────────
 
 async def check_unstakes(context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_ids = set(state["chat_ids"])
-    if not chat_ids:
-        logger.warning("No subscribers. Have users send /start to the bot.")
+    subscribers = dict(state["subscribers"])
+    if not subscribers:
+        logger.warning("No subscribers.")
         return
 
     try:
@@ -305,20 +326,20 @@ async def check_unstakes(context: ContextTypes.DEFAULT_TYPE) -> None:
                     amount_nanos = meta.get("UnstakeAmountNanos") or meta.get("StakeAmountNanos")
                     deso_amount = nanos_to_deso(amount_nanos)
                     usd_value = (deso_amount * price) if (deso_amount and price) else None
-
-                    if state["min_usd"] > 0 and (usd_value is None or usd_value < state["min_usd"]):
-                        logger.info(f"Skipping — below threshold (${usd_value} < ${state['min_usd']})")
-                        continue
-
                     msg = build_notification(txn, height, deso_amount, usd_value)
-                    for chat_id in chat_ids:
+
+                    for chat_id, min_usd in subscribers.items():
+                        if min_usd > 0 and (usd_value is None or usd_value < min_usd):
+                            logger.info(f"Skipping chat {chat_id} — below threshold")
+                            continue
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=msg,
                             parse_mode="HTML",
                             disable_web_page_preview=True,
                         )
-                    logger.info(f"Notified {len(chat_ids)} subscriber(s) — block #{height}")
+
+                    logger.info(f"Processed unstake in block #{height}")
 
             except Exception as e:
                 logger.error(f"Error processing block #{height}: {e}")
@@ -346,7 +367,6 @@ def main() -> None:
     app.add_handler(CommandHandler("setmin", setmin))
     app.add_handler(CommandHandler("price", price_cmd))
     app.add_handler(CommandHandler("settings", settings))
-    app.add_handler(CommandHandler("status", status))
 
     app.job_queue.run_repeating(check_unstakes, interval=POLL_INTERVAL, first=5)
 
