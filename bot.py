@@ -322,6 +322,15 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        f"Status: Running\n"
+        f"Subscribers: <b>{len(state['subscribers'])}</b>\n"
+        f"Last block checked: <code>{state['last_block']}</code>",
+        parse_mode="HTML",
+    )
+
+
 # ── Polling loop ──────────────────────────────────────────────────────────────
 
 async def check_unstakes(context: ContextTypes.DEFAULT_TYPE) -> None:
