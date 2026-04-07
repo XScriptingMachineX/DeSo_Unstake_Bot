@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -9,12 +10,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DESO_NODE = "https://node.deso.org"
 DESO_PRICE_URL = "https://node.deso.org/api/v0/get-exchange-rate"
-POLL_INTERVAL = 30        # seconds between block scans
-PRICE_TTL = 300           # refresh price every 5 minutes
-UNSTAKE_TXN_TYPE = 37    # TxnTypeJSON for UNSTAKE in DeSo protocol
+POLL_INTERVAL = 30
+PRICE_TTL = 300
+UNSTAKE_TXN_TYPE = 37
+SUBSCRIBERS_FILE = "subscribers.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -25,13 +26,38 @@ logger = logging.getLogger(__name__)
 state = {
     "last_block": 0,
     "chat_ids": set(),
-    "min_usd": 0.0,          # 0 = notify for all amounts
+    "min_usd": 0.0,
     "deso_price_usd": None,
     "price_updated_at": 0.0,
 }
 
 
-# ── Price ────────────────────────────────────────────────────────────────────
+# ── Persistence ───────────────────────────────────────────────────────────────
+
+def load_subscribers() -> None:
+    if os.path.exists(SUBSCRIBERS_FILE):
+        try:
+            with open(SUBSCRIBERS_FILE) as f:
+                data = json.load(f)
+                state["chat_ids"] = set(data.get("chat_ids", []))
+                state["min_usd"] = data.get("min_usd", 0.0)
+            logger.info(f"Loaded {len(state['chat_ids'])} subscriber(s)")
+        except Exception as e:
+            logger.error(f"Failed to load subscribers: {e}")
+
+
+def save_subscribers() -> None:
+    try:
+        with open(SUBSCRIBERS_FILE, "w") as f:
+            json.dump({
+                "chat_ids": list(state["chat_ids"]),
+                "min_usd": state["min_usd"],
+            }, f)
+    except Exception as e:
+        logger.error(f"Failed to save subscribers: {e}")
+
+
+# ── Price ─────────────────────────────────────────────────────────────────────
 
 def get_deso_price() -> float | None:
     now = time.time()
@@ -40,18 +66,17 @@ def get_deso_price() -> float | None:
     try:
         resp = requests.get(DESO_PRICE_URL, timeout=10)
         resp.raise_for_status()
-        usd_cents = resp.json()["USDCentsPerDeSoExchangeRate"]
-        price = usd_cents / 100
+        price = resp.json()["USDCentsPerDeSoExchangeRate"] / 100
         state["deso_price_usd"] = price
         state["price_updated_at"] = now
         logger.info(f"DeSo price refreshed: ${price}")
         return price
     except Exception as e:
         logger.error(f"Price fetch failed: {e}")
-        return state["deso_price_usd"]  # return stale cache if available
+        return state["deso_price_usd"]
 
 
-# ── DeSo API ─────────────────────────────────────────────────────────────────
+# ── DeSo API ──────────────────────────────────────────────────────────────────
 
 def get_latest_block_height() -> int:
     resp = requests.post(f"{DESO_NODE}/api/v1/node-info", json={}, timeout=10)
@@ -72,9 +97,7 @@ def get_block(height: int) -> dict:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def nanos_to_deso(nanos) -> float | None:
-    if not nanos:
-        return None
-    return int(nanos) / 1e9
+    return int(nanos) / 1e9 if nanos else None
 
 
 def short_key(key: str) -> str:
@@ -107,15 +130,20 @@ def build_notification(txn: dict, height: int, deso_amount: float | None, usd_va
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    already_subscribed = chat_id in state["chat_ids"]
     state["chat_ids"].add(chat_id)
+    save_subscribers()
+
     price = get_deso_price()
     price_str = f"${price:,.4f}" if price else "unavailable"
     min_usd = state["min_usd"]
     threshold_str = f"${min_usd:,.2f}" if min_usd > 0 else "None (all unstakes)"
 
+    msg = "Welcome back! You're already subscribed." if already_subscribed else "You're now subscribed to DeSo unstake alerts!"
+
     await update.message.reply_text(
-        f"<b>DeSo Unstake Monitor</b>\n\n"
-        f"Chat ID: <code>{chat_id}</code>\n"
+        f"<b>DeSo Unstake Monitor</b>\n"
+        f"{msg}\n\n"
         f"DeSo price: <b>{price_str}</b>\n"
         f"Min threshold: <b>{threshold_str}</b>\n\n"
         f"<b>Commands:</b>\n"
@@ -124,10 +152,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"  e.g. <code>/setmin 0</code> → notify for all unstakes\n"
         f"/price — current DeSo price\n"
         f"/settings — show current config\n"
+        f"/stop — unsubscribe from alerts\n"
         f"/status — last block scanned",
         parse_mode="HTML",
     )
-    logger.info(f"Registered chat_id: {chat_id}")
+    logger.info(f"{'Re-registered' if already_subscribed else 'Registered'} chat_id: {chat_id} — total: {len(state['chat_ids'])}")
+
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    state["chat_ids"].discard(chat_id)
+    save_subscribers()
+    await update.message.reply_text("You've been unsubscribed. Send /start anytime to re-subscribe.")
+    logger.info(f"Unsubscribed chat_id: {chat_id} — remaining: {len(state['chat_ids'])}")
 
 
 async def setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -143,6 +180,7 @@ async def setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state["min_usd"] = amount
+    save_subscribers()
     price = get_deso_price()
 
     if amount == 0:
@@ -150,8 +188,8 @@ async def setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         deso_equiv = f"~{amount / price:,.2f} DESO" if price else "unknown DESO"
         await update.message.reply_text(
-            f"Threshold set to <b>${amount:,.2f}</b> ({deso_equiv} at current price).\n\n"
-            f"You'll only be notified when an unstake exceeds this amount.",
+            f"Threshold set to <b>${amount:,.2f}</b> ({deso_equiv} at current price).\n"
+            f"Only unstakes above this amount will trigger a notification.",
             parse_mode="HTML",
         )
 
@@ -182,6 +220,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"<b>Current Settings</b>\n\n"
         f"DeSo price: <b>{price_str}</b>\n"
         f"Min threshold: <b>{threshold_str}</b> {deso_equiv}\n"
+        f"Subscribers: <b>{len(state['chat_ids'])}</b>\n"
         f"Last block: <code>{state['last_block']}</code>",
         parse_mode="HTML",
     )
@@ -189,7 +228,9 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"Status: Running\nLast block checked: <code>{state['last_block']}</code>",
+        f"Status: Running\n"
+        f"Subscribers: <b>{len(state['chat_ids'])}</b>\n"
+        f"Last block checked: <code>{state['last_block']}</code>",
         parse_mode="HTML",
     )
 
@@ -198,11 +239,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def check_unstakes(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_ids = set(state["chat_ids"])
-    if TELEGRAM_CHAT_ID:
-        chat_ids.add(int(TELEGRAM_CHAT_ID))
-
     if not chat_ids:
-        logger.warning("No chat IDs registered. Send /start to the bot.")
+        logger.warning("No subscribers. Have users send /start to the bot.")
         return
 
     try:
@@ -231,9 +269,8 @@ async def check_unstakes(context: ContextTypes.DEFAULT_TYPE) -> None:
                     deso_amount = nanos_to_deso(amount_nanos)
                     usd_value = (deso_amount * price) if (deso_amount and price) else None
 
-                    # Apply threshold filter
                     if state["min_usd"] > 0 and (usd_value is None or usd_value < state["min_usd"]):
-                        logger.info(f"Skipping unstake in block #{height} — below threshold (${usd_value:.2f} < ${state['min_usd']:.2f})")
+                        logger.info(f"Skipping — below threshold (${usd_value} < ${state['min_usd']})")
                         continue
 
                     msg = build_notification(txn, height, deso_amount, usd_value)
@@ -244,7 +281,7 @@ async def check_unstakes(context: ContextTypes.DEFAULT_TYPE) -> None:
                             parse_mode="HTML",
                             disable_web_page_preview=True,
                         )
-                    logger.info(f"Notified unstake in block #{height} — ${usd_value:.2f}" if usd_value else f"Notified unstake in block #{height}")
+                    logger.info(f"Notified {len(chat_ids)} subscriber(s) — block #{height}")
 
             except Exception as e:
                 logger.error(f"Error processing block #{height}: {e}")
@@ -261,9 +298,11 @@ def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    load_subscribers()
 
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("setmin", setmin))
     app.add_handler(CommandHandler("price", price_cmd))
     app.add_handler(CommandHandler("settings", settings))
