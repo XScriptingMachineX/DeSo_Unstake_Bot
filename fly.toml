@@ -7,6 +7,10 @@ primary_region = 'iad'
 
 # No [http_service] — this is a worker. Removing it prevents auto-stop on idle.
 
+[mounts]
+  source = "deso_bot_data"
+  destination = "/data"
+
 [[vm]]
   memory = '256mb'
   cpu_kind = 'shared'
