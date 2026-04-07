@@ -11,7 +11,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DESO_NODE = "https://node.deso.org"
-COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=deso&vs_currencies=usd"
+DESO_PRICE_URL = "https://node.deso.org/api/v0/get-exchange-rate"
 POLL_INTERVAL = 30        # seconds between block scans
 PRICE_TTL = 300           # refresh price every 5 minutes
 UNSTAKE_TXN_TYPE = 37    # TxnTypeJSON for UNSTAKE in DeSo protocol
@@ -38,9 +38,10 @@ def get_deso_price() -> float | None:
     if state["deso_price_usd"] and now - state["price_updated_at"] < PRICE_TTL:
         return state["deso_price_usd"]
     try:
-        resp = requests.get(COINGECKO_URL, timeout=10)
+        resp = requests.get(DESO_PRICE_URL, timeout=10)
         resp.raise_for_status()
-        price = resp.json()["deso"]["usd"]
+        usd_cents = resp.json()["USDCentsPerDeSoExchangeRate"]
+        price = usd_cents / 100
         state["deso_price_usd"] = price
         state["price_updated_at"] = now
         logger.info(f"DeSo price refreshed: ${price}")
