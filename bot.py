@@ -135,11 +135,7 @@ def get_deso_username(public_key: str) -> str:
 def get_latest_block_height() -> int:
     resp = requests.post(f"{DESO_NODE}/api/v1/node-info", json={}, timeout=10)
     resp.raise_for_status()
-    data = resp.json()
-    if "LatestBlockHeight" not in data:
-        logger.error(f"Unexpected node-info response: {data}")
-        raise KeyError(f"LatestBlockHeight not found. Keys: {list(data.keys())}")
-    return data["LatestBlockHeight"]
+    return resp.json()["DeSoStatus"]["LatestBlockHeight"]
 
 
 def get_block(height: int) -> dict:
