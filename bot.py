@@ -15,7 +15,7 @@ DESO_PRICE_URL = "https://node.deso.org/api/v0/get-exchange-rate"
 POLL_INTERVAL = 30
 PRICE_TTL = 300
 UNSTAKE_TXN_TYPE = 37
-SUBSCRIBERS_FILE = "/data/subscribers.json"
+SUBSCRIBERS_FILE = "subscribers.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
