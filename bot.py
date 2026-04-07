@@ -1,7 +1,8 @@
-import json
 import logging
 import os
 import time
+import psycopg2
+import psycopg2.extras
 import requests
 from dotenv import load_dotenv
 from telegram import Update
@@ -10,12 +11,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 DESO_NODE = "https://node.deso.org"
 DESO_PRICE_URL = "https://node.deso.org/api/v0/get-exchange-rate"
 POLL_INTERVAL = 30
 PRICE_TTL = 300
 UNSTAKE_TXN_TYPE = 37
-SUBSCRIBERS_FILE = "subscribers.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -32,29 +33,66 @@ state = {
 }
 
 
-# ── Persistence ───────────────────────────────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────────────────
 
-def load_subscribers() -> None:
-    if os.path.exists(SUBSCRIBERS_FILE):
-        try:
-            with open(SUBSCRIBERS_FILE) as f:
-                data = json.load(f)
-                state["chat_ids"] = set(data.get("chat_ids", []))
-                state["min_usd"] = data.get("min_usd", 0.0)
-            logger.info(f"Loaded {len(state['chat_ids'])} subscriber(s)")
-        except Exception as e:
-            logger.error(f"Failed to load subscribers: {e}")
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
 
 
-def save_subscribers() -> None:
-    try:
-        with open(SUBSCRIBERS_FILE, "w") as f:
-            json.dump({
-                "chat_ids": list(state["chat_ids"]),
-                "min_usd": state["min_usd"],
-            }, f)
-    except Exception as e:
-        logger.error(f"Failed to save subscribers: {e}")
+def init_db() -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscribers (
+                    chat_id BIGINT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            """)
+        conn.commit()
+    logger.info("Database initialized")
+
+
+def load_from_db() -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT chat_id FROM subscribers")
+            state["chat_ids"] = {row[0] for row in cur.fetchall()}
+
+            cur.execute("SELECT value FROM settings WHERE key = 'min_usd'")
+            row = cur.fetchone()
+            state["min_usd"] = float(row[0]) if row else 0.0
+
+    logger.info(f"Loaded {len(state['chat_ids'])} subscriber(s), min_usd=${state['min_usd']}")
+
+
+def db_add_subscriber(chat_id: int) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO subscribers (chat_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (chat_id,)
+            )
+        conn.commit()
+
+
+def db_remove_subscriber(chat_id: int) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM subscribers WHERE chat_id = %s", (chat_id,))
+        conn.commit()
+
+
+def db_set_min_usd(amount: float) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO settings (key, value) VALUES ('min_usd', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (str(amount),))
+        conn.commit()
 
 
 # ── Price ─────────────────────────────────────────────────────────────────────
@@ -132,13 +170,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     already_subscribed = chat_id in state["chat_ids"]
     state["chat_ids"].add(chat_id)
-    save_subscribers()
+    db_add_subscriber(chat_id)
 
     price = get_deso_price()
     price_str = f"${price:,.4f}" if price else "unavailable"
     min_usd = state["min_usd"]
     threshold_str = f"${min_usd:,.2f}" if min_usd > 0 else "None (all unstakes)"
-
     msg = "Welcome back! You're already subscribed." if already_subscribed else "You're now subscribed to DeSo unstake alerts!"
 
     await update.message.reply_text(
@@ -162,7 +199,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     state["chat_ids"].discard(chat_id)
-    save_subscribers()
+    db_remove_subscriber(chat_id)
     await update.message.reply_text("You've been unsubscribed. Send /start anytime to re-subscribe.")
     logger.info(f"Unsubscribed chat_id: {chat_id} — remaining: {len(state['chat_ids'])}")
 
@@ -180,7 +217,7 @@ async def setmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state["min_usd"] = amount
-    save_subscribers()
+    db_set_min_usd(amount)
     price = get_deso_price()
 
     if amount == 0:
@@ -297,8 +334,11 @@ async def check_unstakes(context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL is not set.")
 
-    load_subscribers()
+    init_db()
+    load_from_db()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
