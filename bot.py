@@ -108,6 +108,30 @@ def get_deso_price() -> float | None:
 
 # ── DeSo API ──────────────────────────────────────────────────────────────────
 
+# Simple in-memory cache so we don't hammer the API for the same keys
+_username_cache: dict[str, str] = {}
+
+def get_deso_username(public_key: str) -> str:
+    if not public_key or public_key == "Unknown":
+        return "Anonymous"
+    if public_key in _username_cache:
+        return _username_cache[public_key]
+    try:
+        resp = requests.post(
+            f"{DESO_NODE}/api/v0/get-single-profile",
+            json={"PublicKeyBase58Check": public_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        profile = resp.json().get("Profile")
+        username = profile.get("Username") if profile else None
+        result = f"@{username}" if username else "Anonymous"
+    except Exception:
+        result = "Anonymous"
+    _username_cache[public_key] = result
+    return result
+
+
 def get_latest_block_height() -> int:
     resp = requests.post(f"{DESO_NODE}/api/v1/node-info", json={}, timeout=10)
     resp.raise_for_status()
@@ -150,14 +174,17 @@ def build_notification(txn: dict, height: int, deso_amount: float | None, usd_va
     meta = txn.get("TxnMeta") or {}
     validator = meta.get("ValidatorPublicKeyBase58Check", "Unknown")
 
+    staker_username = get_deso_username(staker)
+    validator_username = get_deso_username(validator)
+
     amount_str = f"{deso_amount:,.4f} DESO" if deso_amount is not None else "Unknown"
     usd_str = f"(~${usd_value:,.2f})" if usd_value is not None else ""
 
     return (
         f"<b>DeSo Unstake Detected</b>\n\n"
         f"Block: <code>#{height}</code>\n"
-        f"Staker: <code>{short_key(staker)}</code>\n"
-        f"Validator: <code>{short_key(validator)}</code>\n"
+        f"Staker: {staker_username} <code>{short_key(staker)}</code>\n"
+        f"Validator: {validator_username} <code>{short_key(validator)}</code>\n"
         f"Amount: <b>{amount_str}</b> {usd_str}\n"
         f"Tx: <code>{short_key(txn_hash)}</code>\n"
         f"<a href=\"https://explorer.deso.com/txn/{txn_hash}\">View on Explorer</a>"
